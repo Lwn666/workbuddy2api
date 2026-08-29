@@ -44,8 +44,25 @@ func WrapWeb(next http.Handler, enabled bool) http.Handler {
 				_, _ = w.Write(data)
 				return
 			}
-			// /web/* 静态资源
-			fileServer.ServeHTTP(w, r)
+			// /web/* 静态资源（剥掉 /web 前缀再交给 FileServer）
+			if p != "/web/" {
+				r2 := r.Clone(r.Context())
+				r2.URL.Path = strings.TrimPrefix(p, "/web")
+				if r2.URL.Path == "" {
+					r2.URL.Path = "/"
+				}
+				fileServer.ServeHTTP(w, r2)
+				return
+			}
+			// /web/ 目录默认返回 index.html
+			data, err := fs.ReadFile(webSub, "index.html")
+			if err != nil {
+				http.Error(w, "web assets missing", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
 			return
 		}
 		next.ServeHTTP(w, r)

@@ -1,8 +1,16 @@
 # WorkBuddy2API
 
-> WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
+> WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应，内置 Web 管理面板。
 
-## 功能特性
+[![Go](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+
+---
+
+## ✨ 功能特性
+
+### 核心能力
 
 - 🔐 **OAuth 登录** — 通过 `/v2/plugin/auth/state` 设备授权流程获取凭证，支持 token 自动刷新
 - 🔄 **多账号轮转** — 加权随机选号（credits 权重），防热点 + 防惊群（100ms 窗口）
@@ -10,24 +18,41 @@
 - 📡 **流式 + 非流式** — 上游 SSE 透传；非流式本地聚合（上游拒绝非流式请求）
 - ⏰ **定时签到** — 每日 09:00 / 21:00 自动签到 + 积分查询，积分耗尽账号次日 04:00 自动恢复
 - 📊 **积分监控** — `credit.sh` 一键查询全部账号剩余/总量/百分比
-- 🔑 **登录工具** — `login.sh` 交互式登录，落盘即生效
-- 🏗 **Docker 部署** — 一键 `docker compose up`，healthcheck 常驻
 - 📈 **请求级日志** — 每个 `/v1/chat/completions` 请求打表格日志（seq/TTFB/uid/tokens/latency）
 - 🏥 **健康检查** — `/healthz` 无健康账号时返回 503，可接负载均衡器
 - 📉 **状态汇总** — `/status` 返回 total/healthy/cooling/disabled 计数 + 每账号完整画像
 
-## 快速开始
+### 内置 Web 面板（本地扩展）
+
+- 🖥 **账号总览** — 统计卡片（总数/可用/冷却/禁用/总积分）+ 账号卡片（积分/状态/冷却至/上次成功/错误）
+- ⚡ **一键签到** — 工具栏按钮手动触发签到轮，无需登录服务器执行脚本
+- 📱 **扫码添加账号** — 页面内弹出二维码，WorkBuddy/CodeBuddy 扫码即完成登录并自动落盘，无需重启
+
+> Web 面板默认开启，设置环境变量 `WEB_DISABLED=1` 可关闭；登录功能可用 `LOGIN_DISABLED=1` 单独关闭。
+
+---
+
+## 🚀 快速开始
 
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/Lwn666/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，设置 api_key
 ```
 
-### 2. 添加账号
+### 2. 添加账号（二选一）
+
+**方式 A：Web 面板扫码**（推荐）
+
+```bash
+docker compose up -d --build
+# 打开 http://<host>:7863/ → 点击「扫码添加账号」→ 手机扫码登录
+```
+
+**方式 B：命令行脚本**
 
 ```bash
 ./login.sh
@@ -52,20 +77,20 @@ curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
 # 健康检查（无健康账号时 503）
 curl -s http://localhost:7863/healthz
 
+# 一键签到（Web 面板同款接口）
+curl -s -X POST http://localhost:7863/api/checkin \
+  -H "Authorization: Bearer your-api-key"
+
 # 聊天补全（流式）
 curl -sN http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
-
-# 聊天补全（非流式，本地聚合）
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
-## 配置说明
+---
+
+## ⚙️ 配置说明
 
 ```json
 {
@@ -86,13 +111,18 @@ curl -s http://localhost:7863/v1/chat/completions \
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+  "features": {
+    "sanitize_blacklist_fingerprints": true
   }
 }
 ```
 
 **注意**：`hard_credit` 字段为历史兼容保留。实际行为由 `CooldownUntilTomorrow4AM` 接管——402 + 余额关键词时，账号冷却到**次日 04:00**（本地时区），等签到任务恢复。
 
-## 账号轮换与冷却策略
+---
+
+## 🔄 账号轮换与冷却策略
 
 ### 状态机
 
@@ -134,7 +164,23 @@ Disabled ←────┘ (session 死亡，永久)
 - `tok`：输出 token 数（从上游 usage.completion_tokens 精确读取，非估算）
 - `uid`：账号 UID 前 8 位
 
-## 工具脚本
+---
+
+## 📡 API 端点
+
+| 端点 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |
+| `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
+| `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
+| `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+| `POST /api/checkin` | Bearer | 一键签到（本地扩展，触发签到轮） |
+| `POST /api/login/start` | Bearer | 发起 OAuth 登录，返回授权 URL 与 state（本地扩展） |
+| `GET /api/login/poll` | Bearer | 轮询扫码登录结果，`pending` 时返回 `{"pending":true}`（本地扩展） |
+
+---
+
+## 🛠 工具脚本
 
 | 脚本 | 用途 |
 |---|---|
@@ -143,16 +189,34 @@ Disabled ←────┘ (session 死亡，永久)
 | `./credit.sh -json` | 积分原始 JSON |
 | `./signin.sh` | 批量签到（遍历 auths/ 下所有账号） |
 
-## API 端点
+---
 
-| 端点 | 鉴权 | 说明 |
-|---|---|---|
-| `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |
-| `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
-| `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
-| `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+## 🏗 架构说明（本地扩展）
 
-## 稳定性设计
+本项目在保持与上游 `Sliverkiss/workbuddy2api` 零冲突同步的前提下扩展 Web 面板：
+
+```
+internal/
+  login/            # 本地新增：OAuth 设备流（纯标准库）
+  server/
+    web/            # 本地新增：前端静态资源（embed）
+    web_extra.go    # 本地新增：WrapWeb 中间件（前端 + 本地 API 路由）
+    local_api.go    # 本地新增：LocalAPI（签到/登录 handler，独立于上游 Handler）
+    handler.go      # 上游文件（不修改）
+  pool/             # 上游文件（不修改）
+  scheduler/        # 上游文件（不修改）
+```
+
+**同步上游**：`scripts/sync-upstream.sh` 自动覆盖上游文件并重放 `cmd/server/main.go` 中 3 行的本地补丁（`LOCAL PATCH` 标记），详见 [scripts/sync-upstream.sh](scripts/sync-upstream.sh)。
+
+```bash
+sh scripts/sync-upstream.sh           # 预览模式
+sh scripts/sync-upstream.sh --apply   # 执行：覆盖 + 自动重放
+```
+
+---
+
+## 🛡 稳定性设计
 
 - **防雪崩**：上游 4xx/5xx 轮转重试（不直接返回），404 短冷却 60s 不累计 errCount
 - **错误分流**：网络层错误不累计 errCount（避免抖动连坐）；HTTP 5xx 累计 errCount 阈值 5 触发冷却
@@ -162,7 +226,9 @@ Disabled ←────┘ (session 死亡，永久)
 - **状态持久化**：`data/state.json` dirty flag + 5s 周期异步落盘，进程退出前强制 flush
 - **防惊群**：100ms 窗口内不重复选中同一账号（高并发时打散热点）
 
-## 开发
+---
+
+## 💻 开发
 
 ### 测试
 
@@ -178,8 +244,6 @@ gofmt -l .  # 应为空
 ```
 cmd/
   server/     # 主服务入口
-  login/      # OAuth 登录工具
-  credit/     # 积分查询工具
   signin/     # 批量签到工具
 internal/
   auth/       # auth 文件解析 + token 刷新
@@ -187,9 +251,23 @@ internal/
   scheduler/  # 定时签到 + 积分查询
   server/     # HTTP handler + 请求日志
   upstream/   # 上游 API 封装（chat/billing/auth）
+  login/      # OAuth 设备流（本地扩展）
+  server/web/ # Web 面板静态资源（本地扩展，embed）
+  server/web_extra.go  # WrapWeb 中间件（本地扩展）
+  server/local_api.go  # 签到/登录 handler（本地扩展）
 ```
 
-## 免责声明
+---
+
+## 🙏 鸣谢
+
+- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) — 本项目的基础上游，感谢作者的账号池、调度器与上游封装等核心实现
+- [CodeBuddy / WorkBuddy CN](https://www.codebuddy.cn) — 提供 OAuth 设备授权与聊天 API
+- [qrcodejs](https://github.com/davidshimjs/qrcodejs) — Web 面板二维码渲染
+
+---
+
+## ⚠️ 免责声明
 
 本项目仅供学习和研究使用。使用者需遵守 WorkBuddy / CodeBuddy 的服务条款，自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
 

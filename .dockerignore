@@ -1,5 +1,6 @@
 auths/
 data/
+config.json
 *.tmp
 .git/
 .gitignore

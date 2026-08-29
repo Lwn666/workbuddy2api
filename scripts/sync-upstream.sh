@@ -10,12 +10,16 @@
 set -eu
 
 cd "$(dirname "$0")"
+# 从脚本位置向上查找仓库根（脚本可放仓库根或 scripts/ 下）
+while [ ! -d .git ] && [ "$(pwd)" != "/" ]; do cd ..; done
 
 # 本地新增文件/目录（上游没有），空格分隔，永不触碰
 LOCAL_ONLY="internal/server/web internal/server/web_extra.go scripts"
 
-# 本地定制文件（含 LOCAL PATCH），覆盖后自动重放
-PROTECTED="cmd/server/main.go"
+# 含 LOCAL PATCH 的文件（自动覆盖上游后重放补丁）
+AUTO_PATCH="cmd/server/main.go"
+# 需手工合并的文件（无补丁逻辑）
+PROTECTED=""
 
 APPLY=0
 if [ "${1:-}" = "--apply" ]; then APPLY=1; fi
@@ -39,6 +43,7 @@ echo "=== 3. 分类 ==="
 SAFE=""
 MANUAL=""
 SKIP=""
+PATCH_FILES=""  # AUTO_PATCH 文件列表（覆盖后需重放补丁）
 for f in $CHANGED; do
   hit=0
   for loc in $LOCAL_ONLY; do
@@ -48,6 +53,16 @@ for f in $CHANGED; do
   done
   if [ $hit -eq 1 ]; then
     SKIP="$SKIP $f"
+    continue
+  fi
+  # AUTO_PATCH 文件归入自动覆盖（覆盖后自动重放 LOCAL PATCH）
+  hit=0
+  for p in $AUTO_PATCH; do
+    if [ "$f" = "$p" ]; then hit=1; break; fi
+  done
+  if [ $hit -eq 1 ]; then
+    SAFE="$SAFE $f"
+    PATCH_FILES="$PATCH_FILES $f"
     continue
   fi
   hit=0
@@ -62,7 +77,21 @@ for f in $CHANGED; do
 done
 
 echo "[自动覆盖 · 安全]"
-if [ -n "$SAFE" ]; then for s in $SAFE; do echo "  $s"; done; else echo "  (无)"; fi
+if [ -n "$SAFE" ]; then
+  for s in $SAFE; do
+    # 跳过 AUTO_PATCH 文件（单独显示）
+    is_patch=0
+    for p in $PATCH_FILES; do [ "$s" = "$p" ] && is_patch=1; done
+    [ $is_patch -eq 0 ] && echo "  $s"
+  done
+else
+  echo "  (无)"
+fi
+if [ -n "$PATCH_FILES" ]; then
+  echo ""
+  echo "[自动覆盖 + 重放补丁]"
+  for p in $PATCH_FILES; do echo "  $p"; done
+fi
 echo ""
 echo "[手工合并 · 含 LOCAL PATCH]"
 if [ -n "$MANUAL" ]; then for m in $MANUAL; do echo "  $m"; done; else echo "  (无)"; fi
@@ -88,19 +117,21 @@ else
   echo "无安全文件需要覆盖。"
 fi
 
-# 自动重放 LOCAL PATCH（main.go 的 3 行前端包装）
-if [ -n "$MANUAL" ]; then
+# 自动重放 LOCAL PATCH（AUTO_PATCH 文件覆盖后补丁丢失，需重新插入）
+if [ -n "$PATCH_FILES" ]; then
   echo ""
   echo "=== 5. 自动重放 LOCAL PATCH ==="
-  python3 - << 'PYEOF'
-p = "cmd/server/main.go"
+  for pf in $PATCH_FILES; do
+    python3 - "$pf" << 'PYEOF'
+import sys
+p = sys.argv[1]
 try:
     s = open(p, encoding="utf-8").read()
 except FileNotFoundError:
-    print("SKIP: cmd/server/main.go 不存在（上游可能改名）"); raise SystemExit(0)
+    print(f"SKIP: {p} 不存在"); raise SystemExit(0)
 
 if "LOCAL PATCH" in s:
-    print("已存在 LOCAL PATCH，跳过"); raise SystemExit(0)
+    print(f"{p}: 已存在 LOCAL PATCH，跳过"); raise SystemExit(0)
 
 anchor = '''\tsrv := &http.Server{
 \t\tAddr:              cfg.Listen,
@@ -114,10 +145,11 @@ patch = '''\t// ── LOCAL PATCH: 内置前端（由 sync-upstream.sh 自动�
 if s.count(anchor) == 1:
     s = s.replace(anchor, patch, 1)
     open(p, "w", encoding="utf-8").write(s)
-    print("LOCAL PATCH 已重放")
+    print(f"{p}: LOCAL PATCH 已重放")
 else:
-    print("WARN: 锚点未找到，需手工检查 main.go")
+    print(f"WARN: {p} 锚点未找到，需手工检查")
 PYEOF
+  done
 fi
 
 echo ""

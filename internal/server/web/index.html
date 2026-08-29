@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkBuddy2API</title>
+  <link rel="stylesheet" href="/web/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">WorkBuddy2API</div>
+    <div class="keybox">
+      <input id="apikey" type="password" placeholder="API Key（与 config.json 一致）" />
+      <button id="saveKey">保存</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 账号总览 -->
+    <section id="dashboard" class="panel active">
+      <div class="toolbar">
+        <button id="refreshStatus">刷新</button>
+        <span id="statusMeta" class="meta"></span>
+      </div>
+      <div id="stats" class="stats hidden">
+        <div class="stat"><div class="num" id="stTotal">0</div><div class="label">账号总数</div></div>
+        <div class="stat"><div class="num" id="stActive">0</div><div class="label">可用</div></div>
+        <div class="stat"><div class="num" id="stCooling">0</div><div class="label">冷却</div></div>
+        <div class="stat"><div class="num" id="stDisabled">0</div><div class="label">禁用</div></div>
+        <div class="stat"><div class="num" id="stCredits">0</div><div class="label">总积分</div></div>
+      </div>
+      <div id="accts" class="accts"></div>
+      <div id="accountsEmpty" class="empty">暂无账号。</div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

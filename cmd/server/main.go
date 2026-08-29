@@ -69,9 +69,12 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 
+	// ── LOCAL PATCH: 内置前端（由 sync-upstream.sh 自动重放；WEB_DISABLED=1 可关闭）----
+	var handler http.Handler = server.WrapWeb(h, os.Getenv("WEB_DISABLED") != "1")
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go func() {

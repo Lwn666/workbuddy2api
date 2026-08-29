@@ -1,41 +1,57 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WorkBuddy2API</title>
-  <link rel="stylesheet" href="/web/style.css" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>WorkBuddy2API</title>
+<link rel="stylesheet" href="/web/style.css">
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">WorkBuddy2API</div>
-    <div class="keybox">
-      <input id="apikey" type="password" placeholder="API Key（与 config.json 一致）" />
-      <button id="saveKey">保存</button>
+<div id="toast" class="hidden"></div>
+<header>
+  <h1>WorkBuddy2API</h1>
+  <div class="key-row">
+    <input id="apikey" type="text" placeholder="API Key" autocomplete="off">
+    <button id="saveKey">保存</button>
+  </div>
+</header>
+
+<main>
+  <!-- 操作栏 -->
+  <div class="toolbar">
+    <button id="checkinBtn">一键签到</button>
+    <button id="loginBtn">扫码添加账号</button>
+    <button id="refreshStatus">刷新</button>
+  </div>
+
+  <!-- 扫码登录浮层 -->
+  <div id="loginOverlay" class="overlay hidden">
+    <div class="box">
+      <h3>扫码添加账号</h3>
+      <div id="qrcode"></div>
+      <p id="loginTip">生成二维码中…</p>
+      <button id="loginCancel">取消</button>
     </div>
-  </header>
+  </div>
 
-  <main>
-    <!-- 账号总览 -->
-    <section id="dashboard" class="panel active">
-      <div class="toolbar">
-        <button id="refreshStatus">刷新</button>
-        <span id="statusMeta" class="meta"></span>
-      </div>
-      <div id="stats" class="stats hidden">
-        <div class="stat"><div class="num" id="stTotal">0</div><div class="label">账号总数</div></div>
-        <div class="stat"><div class="num" id="stActive">0</div><div class="label">可用</div></div>
-        <div class="stat"><div class="num" id="stCooling">0</div><div class="label">冷却</div></div>
-        <div class="stat"><div class="num" id="stDisabled">0</div><div class="label">禁用</div></div>
-        <div class="stat"><div class="num" id="stCredits">0</div><div class="label">总积分</div></div>
-      </div>
-      <div id="accts" class="accts"></div>
-      <div id="accountsEmpty" class="empty">暂无账号。</div>
-    </section>
-  </main>
+  <!-- 统计卡片 -->
+  <div id="stats" class="hidden">
+    <div class="stat-row">
+      <div class="stat"><span class="num" id="stTotal">0</span><div class="lab">总数</div></div>
+      <div class="stat"><span class="num" id="stActive">0</span><div class="lab">可用</div></div>
+      <div class="stat"><span class="num" id="stCooling">0</span><div class="lab">冷却</div></div>
+      <div class="stat"><span class="num" id="stDisabled">0</span><div class="lab">禁用</div></div>
+      <div class="stat"><span class="num" id="stCredits">0</span><div class="lab">积分</div></div>
+    </div>
+  </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <!-- 账号卡片 -->
+  <div id="accountsEmpty" class="hidden">暂无账号</div>
+  <div id="accts"></div>
+  <div id="statusMeta" class="meta"></div>
+</main>
 
-  <script src="/web/app.js"></script>
+<script src="/web/app.js"></script>
 </body>
 </html>

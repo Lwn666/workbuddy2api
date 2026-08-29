@@ -69,8 +69,9 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 
-	// ── LOCAL PATCH: 内置前端（由 sync-upstream.sh 自动重放；WEB_DISABLED=1 可关闭）----
-	var handler http.Handler = server.WrapWeb(h, os.Getenv("WEB_DISABLED") != "1")
+	// ── LOCAL PATCH: 内置前端 + 本地 API（签到/扫码登录；由 sync-upstream.sh 自动重放；WEB_DISABLED=1 可关闭）----
+	localAPI := server.NewLocalAPI(p, up, func() { go sch.RunCheckinNow() }, cfg.AuthDir, os.Getenv("LOGIN_DISABLED") != "1")
+	var handler http.Handler = server.WrapWeb(h, os.Getenv("WEB_DISABLED") != "1", localAPI)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

@@ -1,4 +1,4 @@
-// WorkBuddy2API 前端（上游兼容版）— 仅依赖 GET /status
+// WorkBuddy2API 前端（上游兼容版）— /status 展示 + 一键签到 + 扫码添加账号
 (function () {
   "use strict";
 
@@ -31,15 +31,86 @@
     });
   }
 
+  // ---- 一键签到 ----
+  function bindCheckin() {
+    $("#checkinBtn").addEventListener("click", function () {
+      if (!key) { toast("请先输入 API Key", true); return; }
+      $("#checkinBtn").disabled = true;
+      api("/api/checkin", { method: "POST", body: "{}" })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (d) { toast(d.message || "签到已触发"); setTimeout(loadStatus, 4000); })
+        .catch(function (e) { toast("签到失败: " + e.message, true); })
+        .finally(function () { $("#checkinBtn").disabled = false; });
+    });
+  }
+
+  // ---- 扫码添加账号 ----
+  var loginState = null;
+  var loginTimer = null;
+
+  function stopLogin() {
+    if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+    loginState = null;
+  }
+
+  function showLogin(bundle) {
+    $("#loginOverlay").classList.remove("hidden");
+    var qr = $("#qrcode");
+    qr.innerHTML = "";
+    new QRCode(qr, {
+      text: bundle.auth_url,
+      width: 220,
+      height: 220,
+      correctLevel: QRCode.CorrectLevel.M
+    });
+    $("#loginTip").textContent = "请用 WorkBuddy/CodeBuddy 扫码，登录完成后自动添加";
+    // 开始轮询
+    loginTimer = setInterval(function () {
+      api("/api/login/poll?state=" + encodeURIComponent(bundle.state))
+        .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)); })
+        .then(function (d) {
+          if (d.pending) return; // 继续等
+          stopLogin();
+          $("#loginOverlay").classList.add("hidden");
+          toast("账号已添加: " + (d.nickname || d.uid));
+          loadStatus();
+        })
+        .catch(function (e) {
+          stopLogin();
+          $("#loginOverlay").classList.add("hidden");
+          toast("登录失败: " + e.message, true);
+        });
+    }, 3000);
+  }
+
+  function bindLogin() {
+    $("#loginBtn").addEventListener("click", function () {
+      if (!key) { toast("请先输入 API Key", true); return; }
+      api("/api/login/start", { method: "POST", body: "{}" })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (d) {
+          if (!d.auth_url) throw new Error("未获取到授权地址");
+          loginState = d;
+          showLogin(d);
+        })
+        .catch(function (e) { toast("登录失败: " + e.message, true); });
+    });
+    $("#loginCancel").addEventListener("click", function () {
+      stopLogin();
+      $("#loginOverlay").classList.add("hidden");
+    });
+  }
+
   // ---- 渲染 ----
   function fmtTime(s) {
     if (!s || s.indexOf("0001-01-01") === 0) return "—";
     return s.replace("T", " ").replace("Z", "").slice(0, 19);
-  }
-
-  function statCard(label, value) {
-    return '<div class="acct"><div class="acct-nick">' + label +
-           '</div><div class="acct-credits">' + value + "</div></div>";
   }
 
   function render(data) {
@@ -95,6 +166,8 @@
   }
 
   bindKey();
+  bindCheckin();
+  bindLogin();
   bind();
   if (key) loadStatus();
 })();

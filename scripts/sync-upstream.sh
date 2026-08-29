@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 while [ ! -d .git ] && [ "$(pwd)" != "/" ]; do cd ..; done
 
 # 本地新增文件/目录（上游没有），空格分隔，永不触碰
-LOCAL_ONLY="internal/server/web internal/server/web_extra.go scripts"
+LOCAL_ONLY="internal/server/web internal/server/web_extra.go internal/server/local_api.go internal/login scripts"
 
 # 含 LOCAL PATCH 的文件（自动覆盖上游后重放补丁）
 AUTO_PATCH="cmd/server/main.go"
@@ -130,14 +130,21 @@ try:
 except FileNotFoundError:
     print(f"SKIP: {p} 不存在"); raise SystemExit(0)
 
+# 已有最新补丁（含 NewLocalAPI）→ 跳过
+if "NewLocalAPI" in s:
+    print(f"{p}: 已存在最新 LOCAL PATCH，跳过"); raise SystemExit(0)
+# 有旧版补丁（含 LOCAL PATCH 但不含 NewLocalAPI）→ 先移除旧补丁行再重打
 if "LOCAL PATCH" in s:
-    print(f"{p}: 已存在 LOCAL PATCH，跳过"); raise SystemExit(0)
+    for ln in s.split("\n"):
+        if "LOCAL PATCH" in ln or "WrapWeb(h," in ln or "var handler http.Handler" in ln:
+            s = s.replace(ln + "\n", "", 1)
 
 anchor = '''\tsrv := &http.Server{
 \t\tAddr:              cfg.Listen,
 \t\tHandler:           h,'''
-patch = '''\t// ── LOCAL PATCH: 内置前端（由 sync-upstream.sh 自动重放；WEB_DISABLED=1 可关闭）----
-\tvar handler http.Handler = server.WrapWeb(h, os.Getenv("WEB_DISABLED") != "1")
+patch = '''\t// ── LOCAL PATCH: 内置前端 + 本地API(签到/扫码登录)（由 sync-upstream.sh 自动重放；WEB_DISABLED=1 可关闭）----
+\tlocalAPI := server.NewLocalAPI(p, up, func() { go sch.RunCheckinNow() }, cfg.AuthDir, os.Getenv("LOGIN_DISABLED") != "1")
+\tvar handler http.Handler = server.WrapWeb(h, os.Getenv("WEB_DISABLED") != "1", localAPI)
 
 \tsrv := &http.Server{
 \t\tAddr:              cfg.Listen,

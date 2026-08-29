@@ -1,11 +1,7 @@
 name: Cleanup Old Image Versions
 
 on:
-  push:
-    branches: ["master"]
   workflow_dispatch:
-  schedule:
-    - cron: "0 4 * * 0"  # 每周日 04:00 UTC
 
 permissions:
   packages: write

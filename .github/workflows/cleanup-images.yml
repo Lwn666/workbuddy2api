@@ -1,0 +1,53 @@
+name: Cleanup Old Image Versions
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 0"  # 每周日 04:00 UTC
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List and delete old container versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== 列出所有版本 ==="
+          gh api /user/packages/container/workbuddy2api/versions?per_page=100 \
+            --paginate > versions.json 2>/tmp/gh_err.txt || {
+              echo "API 失败，尝试 repo 级"; 
+              gh api /repos/${{ github.repository }}/packages/container/workbuddy2api/versions?per_page=100 \
+                --paginate > versions.json 2>/tmp/gh_err.txt || cat /tmp/gh_err.txt
+            }
+          python3 << 'PYEOF'
+          import json
+          try:
+              data = json.load(open('versions.json'))
+          except Exception as e:
+              print("解析失败:", e); raise SystemExit(1)
+          if isinstance(data, dict):
+              print("API 返回:", data); raise SystemExit(1)
+          print(f"共 {len(data)} 个版本")
+          # 按创建时间排序，保留最新
+          data.sort(key=lambda v: v.get('created_at', ''), reverse=True)
+          keep = [data[0]] if data else []
+          for v in data[1:]:
+              print(f"删除: {v['id']} ({v.get('name','?')}) created={v.get('created_at','?')}")
+          open('to_delete.txt', 'w').write('\n'.join(str(v['id']) for v in data[1:]))
+          open('to_keep.txt', 'w').write('\n'.join(str(v['id']) for v in keep))
+          print(f"保留: {len(keep)} 个, 删除: {len(data)-1} 个")
+          PYEOF
+          echo "=== 执行删除 ==="
+          while read -r vid; do
+            [ -z "$vid" ] && continue
+            echo "删除版本 $vid ..."
+            gh api -X DELETE /user/packages/container/workbuddy2api/versions/$vid || \
+              gh api -X DELETE /repos/${{ github.repository }}/packages/container/workbuddy2api/versions/$vid || \
+              echo "删除 $vid 失败"
+          done < to_delete.txt
+          echo "=== 完成 ==="

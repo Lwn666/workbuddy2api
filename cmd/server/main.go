@@ -65,13 +65,20 @@ func main() {
 		ErrCooldown:  cfg.ErrCooldownDur,
 	})
 
+	// 内置 Web 前端控制台：账号总览 + 一键签到 + 扫码登录（WEB_DISABLED=1 关闭）
+	var handler http.Handler = h
+	if os.Getenv("WEB_DISABLED") != "1" {
+		localAPI := server.NewLocalAPI(p, up, func() { go sch.RunCheckinNow() }, cfg.AuthDir, os.Getenv("LOGIN_DISABLED") != "1")
+		handler = server.WrapWeb(h, true, localAPI)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go func() {

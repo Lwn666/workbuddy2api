@@ -2,9 +2,14 @@
 
 > WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
 
+🍴 **复刻说明（Fork）**：本仓库为 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的二次开发，遵循原项目 MIT 协议。相比上游新增：**内置 Web 前端控制台、一键签到、扫码登录**，并附带**上游安全同步脚本**（`scripts/sync-upstream.sh`，按文件分类覆盖 + 自动重放 LOCAL PATCH，与上游零冲突）。
+
 ## 功能特性
 
 - 🔐 **OAuth 登录** — 通过 `/v2/plugin/auth/state` 设备授权流程获取凭证，支持 token 自动刷新
+- 🖥 **内置前端** — Web 控制台：账号总览卡片（昵称/UID/积分/状态徽章/禁用原因），一键刷新
+- 🎯 **一键签到** — 前端按钮触发签到轮（POST /api/checkin），等效 scheduler 09:00/21:00 自动签到
+- 📱 **扫码登录** — 生成二维码，手机扫码完成 OAuth 落盘（POST /api/login/start + /api/login/poll），热加入无需重启
 - 🔄 **多账号轮转** — 加权随机选号（credits 权重），防热点 + 防惊群（100ms 窗口）
 - 🛠 **工具调用** — 完整支持 OpenAI tools/tool_choice，流式 `tool_calls` 按 index 合并
 - 📡 **流式 + 非流式** — 上游 SSE 透传；非流式本地聚合（上游拒绝非流式请求）
@@ -18,10 +23,11 @@
 
 ## 快速开始
 
+
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/Lwn666/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，设置 api_key
@@ -34,13 +40,24 @@ cp config.example.json config.json
 # 打开浏览器登录 → 按 y → 自动落盘 auths/ → 重启容器
 ```
 
+> 💡 也可以直接用 Web 前端的「扫码登录」页完成，落盘后热加入账号池，**无需重启**。
+
 ### 3. 启动服务
 
 ```bash
 docker compose up -d --build
 ```
 
-### 4. 验证
+### 4. 使用内置前端
+
+启动后浏览器打开 `http://localhost:7863/`，填入 API Key（存 localStorage，刷新不丢）：
+
+- **账号总览**：统计卡片（账号数 / 可用数 / 禁用数）+ 每个账号一张卡片（昵称、UID、积分、状态徽章、到期时间、禁用原因）；支持**一键刷新**与**手动签到**
+- **扫码登录**：点击「生成登录二维码」→ 手机扫码完成 WorkBuddy 登录 → 自动落盘 `auths/` 并加入账号池，**无需重启**
+
+> 前端与上游 API 完全隔离（`internal/server/web/` + `web_extra.go`），`WEB_DISABLED=1` 可关闭。
+
+### 5. 验证
 
 ```bash
 # 模型列表
@@ -142,6 +159,21 @@ Disabled ←────┘ (session 死亡，永久)
 | `./credit.sh` | 积分日报（美化输出） |
 | `./credit.sh -json` | 积分原始 JSON |
 | `./signin.sh` | 批量签到（遍历 auths/ 下所有账号） |
+| `scripts/sync-upstream.sh` | 安全同步上游更新（预览 / `--apply` 执行） |
+
+### 上游同步
+
+本 fork 与上游无共同祖先，直接 merge 会全冲突，故采用**按文件分类定向覆盖**：
+
+```
+sh scripts/sync-upstream.sh            # 预览：列出差异与分类
+sh scripts/sync-upstream.sh --apply    # 执行：覆盖安全文件 + 自动重放 LOCAL PATCH
+```
+
+- **LOCAL_ONLY**（永不触碰）：`internal/server/web/`、`web_extra.go`、`local_api.go`、`internal/login/`、`scripts/`、`.github/`
+- **AUTO_PATCH**（覆盖后自动重放）：`cmd/server/main.go`（LOCAL PATCH 锚点重放）
+- **安全覆盖**：其余上游文件直接 `git checkout upstream/master --`
+- 执行前先 `git remote add upstream https://github.com/Sliverkiss/workbuddy2api.git`
 
 ## API 端点
 
@@ -151,6 +183,11 @@ Disabled ←────┘ (session 死亡，永久)
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+| `POST /api/checkin` | Bearer | 手动触发签到轮（本地扩展） |
+| `POST /api/login/start` | 无 | 生成扫码登录二维码（本地扩展） |
+| `GET /api/login/poll` | 无 | 轮询扫码登录结果（本地扩展） |
+
+> 本地扩展端点由 `internal/server/local_api.go` 提供，`LOGIN_DISABLED=1` 可关闭。
 
 ## 稳定性设计
 

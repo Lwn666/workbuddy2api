@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 while [ ! -d .git ] && [ "$(pwd)" != "/" ]; do cd ..; done
 
 # 本地新增文件/目录（上游没有），空格分隔，永不触碰
-LOCAL_ONLY="internal/server/web internal/server/web_extra.go internal/server/local_api.go internal/login scripts .github"
+LOCAL_ONLY="internal/server/web internal/server/web_extra.go internal/server/local_api.go internal/login scripts .github Dockerfile"
 
 # 含 LOCAL PATCH 的文件（自动覆盖上游后重放补丁）
 AUTO_PATCH="cmd/server/main.go"

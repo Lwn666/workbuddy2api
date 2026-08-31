@@ -4,7 +4,7 @@ data/
 *.key
 *.pem
 
-# Binaries
+# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
 /login
 /credit
 /wb2api

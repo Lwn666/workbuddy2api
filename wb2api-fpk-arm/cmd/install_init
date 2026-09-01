@@ -1,0 +1,8 @@
+#!/bin/bash
+set -u
+
+# 安装应用文件前执行。创建持久数据目录占位（幂等）。
+mkdir -p "${TRIM_PKGVAR:-/tmp/wb2api-stub}/auths" \
+  "${TRIM_PKGVAR:-/tmp/wb2api-stub}/data" 2>/dev/null || true
+
+exit 0

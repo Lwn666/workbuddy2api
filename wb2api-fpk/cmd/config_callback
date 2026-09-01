@@ -1,0 +1,28 @@
+#!/bin/bash
+set -u
+
+# 配置变更应用后：更新 api_key 并重启服务使配置生效。
+# 防御式处理，避免非 fnOS 环境报错。
+
+CONFIG_FILE="${TRIM_PKGETC:-}/config.json"
+MAIN="${TRIM_APPDEST:-}/../cmd/main"
+
+[ -n "${TRIM_PKGETC:-}" ] && [ -f "$CONFIG_FILE" ] || exit 0
+
+if [ -n "${wizard_api_key:-}" ]; then
+  python3 - "$CONFIG_FILE" "$wizard_api_key" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+data["api_key"] = key
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+fi
+
+[ -x "$MAIN" ] || exit 0
+"$MAIN" stop >/dev/null 2>&1 || true
+"$MAIN" start

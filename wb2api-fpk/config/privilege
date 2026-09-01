@@ -1,0 +1,7 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "username": "workbuddy2api",
+  "groupname": "workbuddy2api"
+}

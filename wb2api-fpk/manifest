@@ -1,0 +1,15 @@
+appname=workbuddy2api
+version=1.1.0
+display_name=WorkBuddy2API
+desc=OpenAI 兼容的本地 API 网关服务，内置 Web 管理页与扫码登录，提供 /v1/chat/completions 与 /v1/models 端点。
+source=thirdparty
+platform=x86
+maintainer=fnOS User
+maintainer_url=
+os_min_version=1.2.0
+desktop_uidir=ui
+desktop_applaunchname=workbuddy2api.main
+service_port=7863
+checkport=true
+ctl_stop=true
+disable_authorization_path=true

@@ -1,0 +1,42 @@
+#!/bin/bash
+set -u
+
+CONFIG_FILE="${TRIM_PKGETC}/config.json"
+mkdir -p "${TRIM_PKGETC}"
+
+# 向导字段以同名环境变量传入；未填写时回退到系统分配的端口与默认值。
+port="${wizard_service_port:-${TRIM_SERVICE_PORT:-7863}}"
+api_key="${wizard_api_key:-}"
+region="${wizard_region:-cn}"
+
+if [ -f "$CONFIG_FILE" ]; then
+  exit 0
+fi
+
+cat > "$CONFIG_FILE" <<EOF
+{
+  "listen": ":${port}",
+  "api_key": "${api_key}",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "region": "${region}",
+  "cooldown": {
+    "hard_credit": "12h",
+    "soft_rate": "60s",
+    "err_threshold": 5,
+    "err_cooldown": "10m"
+  },
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "keepalive_hours": [22]
+  },
+  "upstream": {
+    "timeout_seconds": 120
+  },
+  "features": {
+    "sanitize_blacklist_fingerprints": true
+  }
+}
+EOF
+
+chmod 600 "$CONFIG_FILE"

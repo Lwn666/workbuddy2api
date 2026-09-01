@@ -1,0 +1,5 @@
+#!/bin/bash
+set -u
+
+# 升级后：配置与数据迁移保持幂等。config.json 存在于 PKGETC，未被升级覆盖。
+exit 0

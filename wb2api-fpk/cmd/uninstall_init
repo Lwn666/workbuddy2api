@@ -1,0 +1,5 @@
+#!/bin/bash
+set -u
+
+# 卸载前：默认保留用户数据（auths/state 位于 PKGVAR，由系统按向导选择处理）。
+exit 0

@@ -230,6 +230,37 @@ internal/
 
 本项目仅供学习和研究使用。使用者需遵守 WorkBuddy / CodeBuddy 的服务条款，自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
 
+## fnOS 安装包（.fpk）
+
+预编译的飞牛 fnOS 应用安装包，支持 x86_64 与 aarch64 架构，可从 [Releases](https://github.com/Lwn666/workbuddy2api/releases/tag/v1.1.0) 下载。
+
+| 版本 | 架构 | 文件 | SHA256 |
+|---|---|---|---|
+| v1.1.0 | x86_64 | `workbuddy2api-1.1.0-x86.fpk` | `24f3c23a91beb956392c8f0b6a3046f6870979011610db383af0f5713ac22328` |
+| v1.1.0 | aarch64 | `workbuddy2api-1.1.0-arm.fpk` | `d2f2d6da1bd87db2c66f9df43bd2c3a1c8b695685542486ff0e7a200e00592ce` |
+
+### 安装
+
+1. 下载对应架构的 fpk
+2. 通过 fnOS 应用中心「手动安装」或 `appcenter-cli install-fpk <文件>` 安装
+3. 完成安装向导后启动应用
+
+### 特性
+
+- OpenAI 兼容接口：`/v1/chat/completions`（流式/非流式）、`/v1/models`、`/status`、`/healthz`
+- 内置 Web 控制台（`http://<NAS>:7863/`）：账号总览、一键签到、扫码登录
+- 二维码库已本地化，离线环境可用
+- 配置修改：应用中心 → 应用设置 → 修改 API Key
+
+### 构建
+
+fpk 打包工程位于 `wb2api-fpk/`（x86）和 `wb2api-fpk-arm/`（arm），重新打包：
+
+```bash
+cd wb2api-fpk  # 或 wb2api-fpk-arm
+fnpack build
+```
+
 ## License
 
 MIT

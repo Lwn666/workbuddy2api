@@ -87,13 +87,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BODY="Auto Sync Upstream 失败，需人工介入。
-
-**Run:** [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-**原因:** 上游更新可能破坏了 LOCAL PATCH 锚点 / fork 依赖符号 / 编译失败
-
-处理方式: 查看 workflow 日志 → 修复 scripts/sync-wb2-fork.sh 或本地代码 → 手动 workflow_dispatch 重试。"
-          gh issue create \
-            --title "⚠️ auto-sync upstream 失败 (run ${{ github.run_id }})" \
-            --body "$BODY" \
-            --label "auto-sync" 2>&1 | tail -1 || true
+          BODY=$'Auto Sync Upstream 失败，需人工介入。\n\n**Run:** [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**原因:** 上游更新可能破坏了 LOCAL PATCH 锚点 / fork 依赖符号 / 编译失败\n\n处理方式: 查看 workflow 日志 → 修复 scripts/sync-wb2-fork.sh 或本地代码 → 手动 workflow_dispatch 重试。'
+          gh issue create --title "⚠️ auto-sync upstream failed (run ${{ github.run_id }})" --body "$BODY" --label "auto-sync" 2>&1 | tail -1 || true

@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   sync:
@@ -79,3 +80,20 @@ jobs:
           git tag "v${{ steps.version.outputs.new_version }}"
           git push origin "v${{ steps.version.outputs.new_version }}"
           echo "✓ 已推送 master 和 tag v${{ steps.version.outputs.new_version }}"
+
+      # 失败通知：任何步骤失败时自动开 Issue（避免静默失败）
+      - name: Create failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="Auto Sync Upstream 失败，需人工介入。
+
+**Run:** [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+**原因:** 上游更新可能破坏了 LOCAL PATCH 锚点 / fork 依赖符号 / 编译失败
+
+处理方式: 查看 workflow 日志 → 修复 scripts/sync-wb2-fork.sh 或本地代码 → 手动 workflow_dispatch 重试。"
+          gh issue create \
+            --title "⚠️ auto-sync upstream 失败 (run ${{ github.run_id }})" \
+            --body "$BODY" \
+            --label "auto-sync" 2>&1 | tail -1 || true

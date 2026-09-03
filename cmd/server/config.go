@@ -19,10 +19,10 @@ type Config struct {
 	Region    string `json:"region"`     // 只收 "cn"
 
 	Cooldown struct {
-		HardCredit  string `json:"hard_credit"`   // "12h"
-		SoftRate    string `json:"soft_rate"`     // "60s"
-		ErrThresh   int    `json:"err_threshold"` // 默认 3
-		ErrCooldown string `json:"err_cooldown"`  // "10m"
+		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
+		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
+		// 旧 config 中的这些键因 JSON 未知字段而自然忽略，不报错。
+		SoftRate string `json:"soft_rate"` // "60s"
 	} `json:"cooldown"`
 
 	Schedule struct {
@@ -39,10 +39,32 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	Upstash struct {
+		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
+		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
+	} `json:"upstash"`
+
+	Pool struct {
+		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+	} `json:"pool"`
+
+	SessionSticky struct {
+		Enabled    bool   `json:"enabled"`     // 默认 true
+		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+	} `json:"session_sticky"`
+
 	// 解析后
-	HardCreditDur  time.Duration `json:"-"`
-	SoftRateDur    time.Duration `json:"-"`
-	ErrCooldownDur time.Duration `json:"-"`
+	SoftRateDur         time.Duration `json:"-"`
+	BreakerCooldownDur  time.Duration `json:"-"`
+	BreakerCooldownMaxD time.Duration `json:"-"`
+	SessionTTL          time.Duration `json:"-"`
+	SessionGCInterval   time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -54,14 +76,20 @@ func Default() *Config {
 		StateFile: "./data/state.json",
 		Region:    "cn",
 	}
-	c.Cooldown.HardCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
-	c.Cooldown.ErrThresh = 3
-	c.Cooldown.ErrCooldown = "10m"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Upstream.TimeoutSeconds = 120
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Pool.MaxInFlight = 3
+	c.Pool.BreakerThreshold = 3
+	c.Pool.BreakerCooldown = "30m"
+	c.Pool.BreakerCooldownMax = "6h"
+	c.Pool.IdleWeightPerHour = 0.5
+	c.Pool.IdleWeightMax = 5.0
+	c.SessionSticky.Enabled = true
+	c.SessionSticky.TTL = "30m"
+	c.SessionSticky.GCInterval = "5m"
 	return c
 }
 
@@ -100,19 +128,8 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_REGION"); v != "" {
 		c.Region = v
 	}
-	if v := os.Getenv("WB2A_HARD_CREDIT"); v != "" {
-		c.Cooldown.HardCredit = v
-	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
-	}
-	if v := os.Getenv("WB2A_ERR_THRESHOLD"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Cooldown.ErrThresh = n
-		}
-	}
-	if v := os.Getenv("WB2A_ERR_COOLDOWN"); v != "" {
-		c.Cooldown.ErrCooldown = v
 	}
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -128,17 +145,29 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	if c.HardCreditDur, err = time.ParseDuration(c.Cooldown.HardCredit); err != nil {
-		return fmt.Errorf("cooldown.hard_credit: %w", err)
-	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
-	if c.ErrCooldownDur, err = time.ParseDuration(c.Cooldown.ErrCooldown); err != nil {
-		return fmt.Errorf("cooldown.err_cooldown: %w", err)
+	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown: %w", err)
 	}
-	if c.Cooldown.ErrThresh <= 0 {
-		c.Cooldown.ErrThresh = 3
+	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+		return fmt.Errorf("session_sticky.ttl: %w", err)
+	}
+	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	if c.Pool.BreakerThreshold <= 0 {
+		c.Pool.BreakerThreshold = 3
+	}
+	if c.Pool.IdleWeightPerHour <= 0 {
+		c.Pool.IdleWeightPerHour = 0.5
+	}
+	if c.Pool.IdleWeightMax <= 0 {
+		c.Pool.IdleWeightMax = 5.0
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120

@@ -8,11 +8,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -55,6 +58,43 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// bindStore 记录粘性绑定镜像调用（不联网），供 D4 端到端断言绑定收敛到最终成功号。
+type bindStore struct {
+	redisstore.Noop
+	mu     sync.Mutex
+	binds  map[string]string
+	delCnt int
+}
+
+func newBindStore() *bindStore { return &bindStore{binds: map[string]string{}} }
+
+func (b *bindStore) SetBind(key, uid string, ttl time.Duration) {
+	b.mu.Lock()
+	b.binds[key] = uid
+	b.mu.Unlock()
+}
+func (b *bindStore) DelBind(key string) {
+	b.mu.Lock()
+	b.delCnt++
+	delete(b.binds, key)
+	b.mu.Unlock()
+}
+func (b *bindStore) LoadBinds() map[string]string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range b.binds {
+		out[k] = v
+	}
+	return out
+}
+func (b *bindStore) lastUID(key string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	u, ok := b.binds[key]
+	return u, ok
+}
 
 // testPoolWith 构建一个所有账号 credits=1000 的池，并注入确定性随机源：
 // randInt64N 恒返回 0 → pickWeighted 必选候选集中积分最高者（第一个）。
@@ -139,7 +179,7 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	// 让 bad 积分更高被先选中
 	p.SetCredits("bad", 2000)
 	p.SetCredits("good", 1000)
-	h := NewHandler(Config{Pool: p, Upstream: up, HardCooldown: time.Hour, SoftCooldown: time.Minute, ErrThreshold: 3, ErrCooldown: 10 * time.Minute})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -153,6 +193,110 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	if !st.Cooling || st.Reason == "" {
 		t.Errorf("bad account should be cooling: %+v", st)
 	}
+}
+
+// TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
+func TestChatStickyFollowsFinalSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"bad", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// 先把会话预绑定到 bad（模拟历史粘性），bad 失败、good 成功 → 绑定应切到 good。
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 500, `{"code":500}`, false
+		}
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		Session:      sess,
+		SoftCooldown: time.Minute,
+	})
+	// 预绑定：sess.Bind("conv-1", "bad")，然后请求体带同 conversation_id。
+	sess.Bind("conv-1", "bad")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 绑定必须收敛到最终成功的 good。
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+		t.Fatalf("sticky binding should follow final success to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	}
+}
+
+// TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
+func TestChatStickySuccessKeepsBinding(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"good"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-1", "good")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+		t.Fatalf("binding should stay good after success, got %s ok=%v", uid, ok)
+	}
+}
+
+// TestChatStickyFullFallsBackToRotation 端到端验证 C3 语义：粘性号满载不可用时，
+// 请求在同一轮内解绑并回落普通轮换选中健康账号，绑定收敛到最终成功号——而非空耗一轮。
+func TestChatStickyFullFallsBackToRotation(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"bad", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	p.SetMaxInFlight(1)
+	p.Acquire("bad")
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		Session:      sess,
+		SoftCooldown: time.Minute,
+	})
+	sess.Bind("conv-1", "bad")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	}
+	p.Release("bad")
 }
 
 func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
@@ -246,25 +390,27 @@ func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 		BillingBaseCN:   "https://fake.example",
 		BillingBaseGlob: "https://fake.example",
 	}
-	// threshold=1：若传输错误也累计 errCount，一次就会冷却
-	h := NewHandler(Config{Pool: p, Upstream: up, ErrThreshold: 1, ErrCooldown: time.Hour})
+	// 传输错误不喂熔断计数：一次 transport error 不应累计 errTotal 也不应熔断。
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
-	if st.Cooling || st.ErrCount != 0 {
+	if st.Cooling || st.ErrTotal != 0 {
 		t.Fatalf("transport error should not penalize account: %+v", st)
 	}
 }
 
 func TestChatHTTP5xxPenalizes(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 熔断阈值 1：一次 5xx 即触发熔断（连续失败语义并入熔断器）。
+	p.SetBreaker(1, time.Hour, time.Hour)
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `{"code":500}`, false
 	})
-	h := NewHandler(Config{Pool: p, Upstream: up, ErrThreshold: 1, ErrCooldown: time.Hour})
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
@@ -272,7 +418,7 @@ func TestChatHTTP5xxPenalizes(t *testing.T) {
 	}
 	st, _ := p.Status("u1")
 	if !st.Cooling {
-		t.Fatalf("http 5xx should cool account with threshold=1: %+v", st)
+		t.Fatalf("http 5xx should trip breaker (cooling) with threshold=1: %+v", st)
 	}
 }
 
@@ -281,14 +427,14 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":400,"msg":"bad request"}`, false
 	})
-	h := NewHandler(Config{Pool: p, Upstream: up, ErrThreshold: 1, ErrCooldown: time.Hour})
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
-	if st.Cooling || st.ErrCount != 0 {
+	if st.Cooling || st.ErrTotal != 0 {
 		t.Fatalf("generic 4xx should not penalize account: %+v", st)
 	}
 }
@@ -421,10 +567,11 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
-	h := NewHandler(Config{Pool: p, Upstream: up, ErrThreshold: 1, ErrCooldown: time.Hour})
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
@@ -432,7 +579,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	}
 	st, _ := p.Status("u1")
 	if !st.Cooling {
-		t.Fatalf("fetch failure should penalize account with threshold=1: %+v", st)
+		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
 	}
 }
 
@@ -533,8 +680,44 @@ func TestStatusEndpoint(t *testing.T) {
 		t.Fatalf("status not json: %v", err)
 	}
 	if statusBody["total"] != float64(1) || statusBody["healthy"] != float64(1) ||
-		statusBody["cooling"] != float64(0) || statusBody["disabled"] != float64(0) {
-		t.Errorf("summary=%v want total=1 healthy=1 cooling=0 disabled=0", statusBody)
+		statusBody["cooling"] != float64(0) || statusBody["disabled"] != float64(0) ||
+		statusBody["in_flight_full"] != float64(0) {
+		t.Errorf("summary=%v want total=1 healthy=1 cooling=0 disabled=0 in_flight_full=0", statusBody)
+	}
+	// Phase v3：池级 sticky_sessions + redis_mode。
+	if statusBody["sticky_sessions"] != float64(0) {
+		t.Errorf("sticky_sessions=%v want 0", statusBody["sticky_sessions"])
+	}
+	if statusBody["redis_mode"] != "noop" {
+		t.Errorf("redis_mode=%v want noop", statusBody["redis_mode"])
+	}
+}
+
+// TestStatusInFlightFull /status 透出满载计数：healthy 且占满在途的账号数。
+func TestStatusInFlightFull(t *testing.T) {
+	p := testPoolWith(
+		&auth.Auth{UID: "full", AccessToken: "at", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "free", AccessToken: "at", ExpiresAt: 9999999999},
+	)
+	p.SetMaxInFlight(1)
+	p.Acquire("full")
+	defer p.Release("full")
+
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var statusBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if statusBody["in_flight_full"] != float64(1) {
+		t.Errorf("in_flight_full=%v want 1", statusBody["in_flight_full"])
+	}
+	if statusBody["healthy"] != float64(2) {
+		t.Errorf("healthy=%v want 2 (full is still healthy by state-machine semantics)", statusBody["healthy"])
 	}
 }
 
@@ -543,8 +726,8 @@ func TestStatusPortraitFields(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
 	p.NoteSuccess("u1")
 	p.NoteSuccess("u1")
-	p.NoteError("u1", 3, time.Hour) // 记录 last_err；CoolErr 冷却由 Cooldown 显式触发
-	p.Cooldown("u1", pool.CoolErr, time.Hour, "consecutive errors")
+	p.NoteError("u1") // 记录 last_err + err_total（累计，不冷却）
+	p.Cooldown("u1", pool.CoolSoft, time.Hour, "429 rate limit")
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
@@ -561,14 +744,14 @@ func TestStatusPortraitFields(t *testing.T) {
 		t.Fatalf("accounts=%d", len(body.Accounts))
 	}
 	st := body.Accounts[0]
-	if !st.Cooling || st.CoolKind != "error_threshold" || st.CoolRemaining <= 0 {
+	if !st.Cooling || st.CoolKind != "soft_rate" || st.CoolRemaining <= 0 {
 		t.Errorf("cooling portrait=%+v", st)
 	}
 	if st.SuccessCount != 2 {
 		t.Errorf("success_count=%d want 2", st.SuccessCount)
 	}
-	if st.ErrCount != 0 {
-		t.Errorf("err_count=%d want 0 (cleared by cooldown)", st.ErrCount)
+	if st.ErrTotal != 1 {
+		t.Errorf("err_total=%d want 1", st.ErrTotal)
 	}
 	if st.LastSuccessTime.IsZero() {
 		t.Error("last_success should be set")
@@ -618,7 +801,34 @@ func TestHealthz503WhenNoHealthy(t *testing.T) {
 	}
 }
 
-// TestHealthz200WithHealthy 有健康账号 → 200。
+// TestHealthz503WhenAllInFlightFull 全部账号 healthy 但都占满在途 → 503（与 chat 同口径），
+// 且 healthy 语义未变（仍为 1）：满载不是状态机健康维度的变化，是探活口径单独叠加。
+func TestHealthz503WhenAllInFlightFull(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.SetMaxInFlight(1)
+	p.Acquire("u1") // 占满唯一在途名额
+	defer p.Release("u1")
+
+	if p.ServableNow() {
+		t.Fatal("servable should be false when the only healthy account is in-flight full")
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503 (healthy but all in-flight full)", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
+	}
+	// healthy 语义未变：账号仍是 healthy（只占满在途，非冷却/禁用）。
+	if resp["healthy"] != float64(1) || resp["total"] != float64(1) {
+		t.Errorf("healthz json=%v want healthy=1 total=1 (healthy semantics unchanged)", resp)
+	}
+}
+
+// TestHealthz200WhenHealthy 有健康账号 → 200。
 func TestHealthz200WithHealthy(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})

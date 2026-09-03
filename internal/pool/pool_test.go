@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,7 +23,8 @@ func withNoPickGap(t *testing.T) {
 
 func TestPickHighestCredits(t *testing.T) {
 	withNoPickGap(t)
-	// P1-8：Top5 加权随机。积分悬殊时高积分账号应被多数选中（不再是必中）。
+	// 三因子加权（credits 比例×10 + 闲置 + 成功率）：积分悬殊时高积分账号应被多数选中，
+	// 但不再像纯 credits 加权那样接近 99%（闲置补偿 + 成功率中性 1.5 拉平了基线）。
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}
 	a2 := &auth.Auth{UID: "u2"}
@@ -34,11 +36,11 @@ func TestPickHighestCredits(t *testing.T) {
 	p.SetCredits("u2", 50000)
 	p.SetCredits("u3", 300)
 	counts := map[string]int{}
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 3000; i++ {
 		counts[p.Pick().UID]++
 	}
-	if counts["u2"] < 240 { // u2 权重 50000/50400 ≈ 99.2%
-		t.Errorf("u2 picked %d/300, want overwhelming majority", counts["u2"])
+	if counts["u2"] <= counts["u1"] || counts["u2"] <= counts["u3"] {
+		t.Errorf("u2 (highest credits) should be picked most: %v", counts)
 	}
 }
 
@@ -70,12 +72,13 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	}
 }
 
-func TestPickNilWhenAllCooling(t *testing.T) {
+func TestPickNilWhenAllDisabled(t *testing.T) {
+	// 全禁用 → 兜底不参与（禁用账号永不参与兜底）→ 返回 nil。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolHard, time.Hour, "x")
+	p.Disable("u1", "session dead")
 	if got := p.Pick(); got != nil {
-		t.Fatalf("want nil, got %+v", got)
+		t.Fatalf("want nil (all disabled), got %+v", got)
 	}
 }
 
@@ -115,7 +118,7 @@ func TestPickExcludingStaysWithinHealthy(t *testing.T) {
 
 func TestPickWeightedSkewTowardHighCredits(t *testing.T) {
 	withNoPickGap(t)
-	// Top5 加权随机：单账号 credits 占比足够高时，多数挑中它。
+	// Top5 三因子加权：单账号 credits 占比足够高时，多数挑中它。
 	p := New("")
 	for _, u := range []string{"w1", "w2", "w3", "w4", "w5", "w6"} {
 		p.Add(&auth.Auth{UID: u})
@@ -123,11 +126,17 @@ func TestPickWeightedSkewTowardHighCredits(t *testing.T) {
 	}
 	p.SetCredits("w1", 1000)
 	counts := map[string]int{}
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 5000; i++ {
 		counts[p.Pick().UID]++
 	}
-	if counts["w1"] < 300 {
-		t.Errorf("w1 picked %d/500, want majority (weighted)", counts["w1"])
+	mx, mxUID := 0, ""
+	for uid, n := range counts {
+		if n > mx {
+			mx, mxUID = n, uid
+		}
+	}
+	if mxUID != "w1" {
+		t.Errorf("w1 (highest credits) should be picked most: %v", counts)
 	}
 }
 
@@ -164,6 +173,57 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 		if got := p.Pick(); got == nil || got.UID == "a6" {
 			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
 		}
+	}
+}
+
+func TestPickTopFiveBySuccessRateNotCredits(t *testing.T) {
+	withNoPickGap(t)
+	// C1 回归：top5 短名单必须按三因子权重（含成功率）而非纯 credits 截断。
+	// a1..a5 credits=100 但成功率极低（1/100），a6 credits=90 但成功率 100%。
+	// 纯 credits 排序时 a6（90 < 100）是第 6 名，永远进不了 top5；
+	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮（后续 a6 闲置补偿衰减会合法发散）。
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 选权重最高的候选
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 100)
+		for i := 0; i < 99; i++ {
+			p.NoteError(u) // 成功率 1/(1+99)≈0.03
+		}
+		p.NoteSuccess(u)
+	}
+	p.Add(&auth.Auth{UID: "a6"})
+	p.SetCredits("a6", 90)
+	p.NoteSuccess("a6") // 成功率 100%
+
+	if got := p.Pick(); got == nil || got.UID != "a6" {
+		t.Fatalf("pick=%v, want a6 (high-success low-credit must enter top5 by weight)", got)
+	}
+}
+
+func TestPickTopFiveByIdleNotCredits(t *testing.T) {
+	withNoPickGap(t)
+	// C1 回归：闲置补偿同样影响短名单。a1..a5 credits=100 但刚被用过（闲置 0），
+	// a6 credits=90 但从未使用（闲置满分）。纯 credits 排序时 a6 进不了 top5；
+	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮。
+	p := New("")
+	now := time.Now()
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 100)
+	}
+	p.Add(&auth.Auth{UID: "a6"})
+	p.SetCredits("a6", 90)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	// a1..a5 全部"刚被用过"，闲置补偿归零；a6 从未使用 → 闲置满分。
+	p.mu.Lock()
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.byUID[u].lastUsed = now
+	}
+	p.mu.Unlock()
+
+	if got := p.Pick(); got == nil || got.UID != "a6" {
+		t.Fatalf("pick=%v, want a6 (idle low-credit must enter top5 by weight)", got)
 	}
 }
 
@@ -258,12 +318,9 @@ func TestCooldownPersists(t *testing.T) {
 	p.Flush() // 状态变更走 dirty 标志，落盘由 Flush / 后台 goroutine 负责
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
-	if p2.Pick() != nil {
-		t.Fatal("cooldown lost after reload")
-	}
 	st, ok := p2.Status("u1")
-	if !ok || st.Reason != "余额不足" {
-		t.Errorf("status=%+v ok=%v", st, ok)
+	if !ok || !st.Cooling || st.Reason != "余额不足" {
+		t.Fatalf("cooldown lost after reload: %+v ok=%v", st, ok)
 	}
 }
 
@@ -301,7 +358,8 @@ func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 0)
-	if p.Pick() != nil {
+	st, _ := p.Status("u1")
+	if !st.Cooling {
 		t.Fatal("zero credits should stay cooling")
 	}
 }
@@ -316,31 +374,42 @@ func TestReenableDoesNotTouchDisabled(t *testing.T) {
 	}
 }
 
-func TestNoteErrorThreshold(t *testing.T) {
+func TestNoteErrorAccumulatesErrTotal(t *testing.T) {
+	// NoteError 语义变更：不再有独立的 err 冷却（CoolErr 已并入熔断器），
+	// 只累计 errTotal（不清零，供成功率权重）并喂熔断器 fails。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	for i := 0; i < 2; i++ {
-		p.NoteError("u1", 3, 10*time.Minute)
-		if p.Pick() == nil {
-			t.Fatalf("cooling too early at %d", i+1)
-		}
+	p.NoteError("u1")
+	p.NoteError("u1")
+	st, _ := p.Status("u1")
+	if st.ErrTotal != 2 {
+		t.Errorf("err_total=%d want 2", st.ErrTotal)
 	}
-	p.NoteError("u1", 3, 10*time.Minute)
-	if p.Pick() != nil {
-		t.Fatal("threshold 3 should cool the account")
+	if st.Cooling {
+		t.Errorf("NoteError alone must not set cooling (no CoolErr): %+v", st)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("last_err not set")
 	}
 }
 
-func TestNoteSuccessResetsCounter(t *testing.T) {
+func TestNoteSuccessResetsBreakerNotErrTotal(t *testing.T) {
+	// NoteSuccess 清 fails/熔断（运行态），但不清 errTotal（累计值）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.NoteError("u1", 3, time.Hour)
-	p.NoteError("u1", 3, time.Hour)
+	p.SetBreaker(2, time.Hour, 2*time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1") // 触发熔断
+	if p.internalHealthy("u1") {
+		t.Fatal("breaker should be open (unhealthy) after 2 failures")
+	}
 	p.NoteSuccess("u1")
-	p.NoteError("u1", 3, time.Hour)
-	p.NoteError("u1", 3, time.Hour)
-	if p.Pick() == nil {
-		t.Fatal("success should reset error counter")
+	st, _ := p.Status("u1")
+	if st.ErrTotal != 2 {
+		t.Errorf("err_total=%d want 2 (cumulative, not cleared by success)", st.ErrTotal)
+	}
+	if st.Cooling {
+		t.Errorf("success should clear breaker: %+v", st)
 	}
 }
 
@@ -362,26 +431,47 @@ func TestNoteSuccessIncrementsAndRecords(t *testing.T) {
 	}
 }
 
-func TestNoteErrorRecordsAndKind(t *testing.T) {
+func TestReenableClearsCoolingNotBreaker(t *testing.T) {
+	// C5：签到解冻只清冷却（until/coolKind/reason）+ 更新 credits，不清熔断
+	// （fails/retryCount/breakerUntil）。签到成功只证明余额与 billing 通道恢复，
+	// 不证明 chat 通道健康——熔断仍按 breakerUntil 退避到期或 NoteSuccess 恢复。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.NoteError("u1", 3, time.Hour)
+	p.CooldownUntilTomorrow4AM("u1", "余额不足") // 硬冷却（喂 fails，但此时阈值默认 3，不熔断）
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断（fails→阈值1→fails=0, retryCount=1, breakerUntil 非零）
+	p.ReenableIfCredits("u1", 500)
 	st, _ := p.Status("u1")
-	if st.ErrCount != 1 {
-		t.Errorf("err_count=%d want 1", st.ErrCount)
+	if st.Reason != "" || st.Credits != 500 {
+		t.Errorf("signin should clear reason + set credits=500: %+v", st)
 	}
-	if st.LastErrTime.IsZero() {
-		t.Error("last_err not set")
+	if st.Until != (time.Time{}) {
+		t.Errorf("signin should clear hard-cooling until: %+v", st.Until)
 	}
-	// 次次累积两笔，第三笔触发冷却 → cool_kind=error_threshold
-	p.NoteError("u1", 3, time.Hour)
-	p.NoteError("u1", 3, time.Hour)
-	st, _ = p.Status("u1")
-	if !st.Cooling || st.CoolKind != "error_threshold" {
-		t.Errorf("cooling portrait=%+v", st)
+	if st.BreakerUntil.IsZero() {
+		t.Fatal("signin must NOT clear breakerUntil (chat health unresolved)")
 	}
-	if st.CoolRemaining <= 0 {
-		t.Errorf("cool_remaining=%d want >0", st.CoolRemaining)
+	// 熔断仍在 → 账号仍不可选（直至 breakerUntil 到期）。
+	if p.internalHealthy("u1") {
+		t.Fatal("account should stay unhealthy while breaker active after signin")
+	}
+}
+
+func TestReenableKeepsBreaker(t *testing.T) {
+	// C5 回归锁定新语义：仅熔断（无冷却）的账号，签到解冻不得清熔断。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("precondition: breaker should be open")
+	}
+	p.ReenableIfCredits("u1", 500)
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("signin must not clear breakerUntil")
+	}
+	if p.internalHealthy("u1") {
+		t.Fatal("account should stay unhealthy while breaker active after signin")
 	}
 }
 
@@ -390,7 +480,7 @@ func TestCoolKindPersistsAcrossReload(t *testing.T) {
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolErr, time.Hour, "consecutive errors")
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.Flush()
 
 	// 旧文件缺新字段时零值 → 冷却应仍工作（向后兼容）。
@@ -400,8 +490,8 @@ func TestCoolKindPersistsAcrossReload(t *testing.T) {
 	if !ok || !st.Cooling {
 		t.Fatalf("cooldown state lost after reload: %+v ok=%v", st, ok)
 	}
-	if st.CoolKind != "error_threshold" {
-		t.Errorf("cool_kind after reload=%q want error_threshold", st.CoolKind)
+	if st.CoolKind != "hard_credit" {
+		t.Errorf("cool_kind after reload=%q want hard_credit", st.CoolKind)
 	}
 }
 
@@ -411,20 +501,23 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
-	p.NoteSuccess("u1")              // successCount=1，last_success 非零
-	p.NoteSuccess("u1")              // successCount=2
-	p.NoteError("u1", 99, time.Hour) // errCount=1（未达阈值），last_err 非零
+	p.NoteSuccess("u1") // successCount=1，last_success 非零
+	p.NoteSuccess("u1") // successCount=2
+	p.NoteError("u1")   // errTotal=1（累计），last_err 非零
 	p.Flush()
 
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// JSON tag 全小写下划线；err_count 此时 =1 所以也会落盘。
-	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_count"`, `"last_success"`, `"last_err"`} {
+	// JSON tag 全小写下划线；err_total 落盘，err_count 不再落盘。
+	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_total"`, `"last_success"`, `"last_err"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("state.json missing %s:\n%s", want, raw)
 		}
+	}
+	if strings.Contains(string(raw), `"err_count"`) {
+		t.Errorf("state.json should not write legacy err_count:\n%s", raw)
 	}
 
 	// 重载后字段保留
@@ -437,8 +530,40 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	if st.SuccessCount != 2 || st.CoolKind != "hard_credit" {
 		t.Errorf("reloaded portrait=%+v", st)
 	}
+	if st.ErrTotal != 1 {
+		t.Errorf("reloaded err_total=%d want 1", st.ErrTotal)
+	}
 	if st.LastSuccessTime.IsZero() || st.LastErrTime.IsZero() {
 		t.Error("last_success/last_err lost after reload")
+	}
+}
+
+func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
+	// 迁移测试：旧 state.json 只含 err_count（连续错误）→ 加载后 err_total 正确。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	legacy := `{"accounts":{"u1":{"credits":100,"err_count":7}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("legacy account should load")
+	}
+	if st.ErrTotal != 7 {
+		t.Errorf("err_total=%d want 7 (migrated from legacy err_count)", st.ErrTotal)
+	}
+	// 新字段优先：二者并存时取较大者。
+	both := `{"accounts":{"u1":{"credits":100,"err_count":3,"err_total":9}}}`
+	if err := os.WriteFile(fp, []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st2, _ := p2.Status("u1"); st2.ErrTotal != 9 {
+		t.Errorf("err_total=%d want 9 (new field wins over legacy)", st2.ErrTotal)
 	}
 }
 
@@ -509,9 +634,9 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 	if d := st.Until.Sub(after); d > 24*time.Hour {
 		t.Errorf("until %v is more than 24h out: %v", st.Until, d)
 	}
-	// 冷却拒选。
-	if p.Pick() != nil {
-		t.Fatal("cooling account should not be picked")
+	// 全冷却时余额耗尽（hard）号不参与兜底 → 返回 nil（等签到恢复）。
+	if got := p.Pick(); got != nil {
+		t.Fatalf("all-hard-cooling should return nil (hard excluded from fallback), got %+v", got)
 	}
 }
 
@@ -524,9 +649,6 @@ func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
 	p.Flush()
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
-	if p2.Pick() != nil {
-		t.Fatal("4am cooldown lost after reload")
-	}
 	st, ok := p2.Status("u1")
 	if !ok || st.Until.Hour() != 4 || st.Reason != "余额不足" {
 		t.Errorf("status after reload=%+v ok=%v", st, ok)
@@ -626,4 +748,549 @@ func TestFlushIdempotentWhenClean(t *testing.T) {
 	if _, err := os.Stat(fp); !os.IsNotExist(err) {
 		t.Fatalf("flush on clean pool should not write: %v", err)
 	}
+}
+
+func TestSaveFailureRecordedAndRecovers(t *testing.T) {
+	// stateFp 的父路径是一个普通文件（非目录）→ MkdirAll/WriteFile 必失败，
+	// root 也不可绕过，可靠地触发落盘失败路径。
+	dir := t.TempDir()
+	block := filepath.Join(dir, "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(filepath.Join(block, "state.json"))
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	if p.persistFails == 0 {
+		t.Fatal("persist failure should be recorded (visible), got 0")
+	}
+
+	// 换回可写目录 → 成功后 persistFails 归零（恢复日志由零值门槛触发）。
+	good := filepath.Join(t.TempDir(), "state.json")
+	p2 := New(good)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.SetCredits("u1", 42)
+	p2.Flush()
+	if p2.persistFails != 0 {
+		t.Fatalf("successful save should reset persistFails, got %d", p2.persistFails)
+	}
+	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+		t.Fatalf("state.json not written on success: %v %s", err, raw)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T2 熔断器 + 全冷却兜底 + 指数退避
+// ---------------------------------------------------------------------------
+
+// breakerUntil 曝露内部运行态供测试断言（包内私有 helper）。
+func (p *Pool) breakerUntil(uid string) (time.Time, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return time.Time{}, false
+	}
+	return e.breakerUntil, true
+}
+
+// internalHealthy 曝露 entry.healthy 供测试断言（包内私有 helper）。
+func (p *Pool) internalHealthy(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	return e.healthy(time.Now())
+}
+
+func TestBreakerTripsAtThreshold(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Hour, 6*time.Hour)
+	for i := 0; i < 2; i++ {
+		p.NoteError("u1") // NoteError 只驱动熔断（不再有单独 err 冷却）
+		if bt, ok := p.breakerUntil("u1"); ok && !bt.IsZero() {
+			t.Fatalf("breaker tripped too early at %d: %v", i+1, bt)
+		}
+	}
+	p.NoteError("u1")
+	bt, ok := p.breakerUntil("u1")
+	if !ok || bt.IsZero() {
+		t.Fatalf("breaker should trip at threshold: until=%v ok=%v", bt, ok)
+	}
+}
+
+func TestBreakerSuccessClears(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Hour, 6*time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1")
+	p.NoteError("u1") // 触发熔断
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("breaker should be open")
+	}
+	p.NoteSuccess("u1")
+	if bt, _ := p.breakerUntil("u1"); !bt.IsZero() {
+		t.Fatalf("success should clear breaker, until=%v", bt)
+	}
+	if !p.internalHealthy("u1") {
+		t.Fatal("account should be healthy after success clears breaker")
+	}
+}
+
+func TestBreakerExponentialBackoffCapped(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Minute, 4*time.Minute) // threshold=3：连续 3 次失败熔断一次
+	// 连续 9 次失败（无成功）→ 熔断 3 次，retryCount 1→2→3，退避 1m→2m→4m(封顶)。
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			p.NoteError("u1") // 连续失败只驱动熔断
+		}
+	}
+	bt, ok := p.breakerUntil("u1")
+	if !ok || bt.IsZero() {
+		t.Fatal("breaker should be open")
+	}
+	d := time.Until(bt)
+	// 第 3 次熔断：d = min(1m * 2^2, 4m) = 4m
+	if d < 4*time.Minute-time.Second || d > 4*time.Minute+time.Second {
+		t.Errorf("backoff should cap at max=4m, got %v", d)
+	}
+
+	// 对比第 1 次熔断（新账号重新来）：退避应更短。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.SetBreaker(3, time.Minute, 4*time.Minute)
+	for j := 0; j < 3; j++ {
+		p2.NoteError("u1")
+	}
+	bt1, _ := p2.breakerUntil("u1")
+	if d1 := time.Until(bt1); d1 > time.Minute+time.Second {
+		t.Errorf("first trip should be ~1m, got %v", d1)
+	}
+}
+
+func TestFallbackPicksEarliestExpiry(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "late"})
+	p.Add(&auth.Auth{UID: "early"})
+	// 两个都软冷却；early 更早到期 → 兜底选 early。
+	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
+	p.Cooldown("early", CoolSoft, time.Hour, "x")
+	got := p.Pick()
+	if got == nil || got.UID != "early" {
+		t.Fatalf("fallback should pick earliest expiry (early), got %+v", got)
+	}
+}
+
+func TestFallbackSkipsDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cooled"})
+	p.Add(&auth.Auth{UID: "dead"})
+	p.Cooldown("cooled", CoolSoft, time.Hour, "x")
+	p.Disable("dead", "session dead") // 禁用不参与兜底
+	got := p.Pick()
+	if got == nil || got.UID != "cooled" {
+		t.Fatalf("fallback should skip disabled, got %+v", got)
+	}
+}
+
+func TestFallbackSkipsHardCooldown(t *testing.T) {
+	// D3：余额耗尽（CoolHard）号不参与兜底——调了必 402，浪费轮换并产生噪音日志。
+	p := New("")
+	p.Add(&auth.Auth{UID: "hard"})
+	p.Cooldown("hard", CoolHard, time.Hour, "余额不足")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("hard-cooled account must not be fallback-picked, got %+v", got)
+	}
+}
+
+func TestFallbackAllHardReturnsNil(t *testing.T) {
+	// 全 hard 冷却 → 无软冷却/熔断号可兜底 → 返回 nil。
+	p := New("")
+	p.Add(&auth.Auth{UID: "h1"})
+	p.Add(&auth.Auth{UID: "h2"})
+	p.Cooldown("h1", CoolHard, time.Hour, "x")
+	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("all-hard should return nil, got %+v", got)
+	}
+}
+
+func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
+	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
+	p := New("")
+	p.Add(&auth.Auth{UID: "soft"})
+	p.Add(&auth.Auth{UID: "brk"})
+	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m, fails=1
+	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)       // 阈值 2：soft 的 1 次失败不熔断
+	p.NoteError("brk")                                  // brk: fails=1
+	p.NoteError("brk")                                  // brk: 熔断，breakerUntil=5m
+	got := p.Pick()
+	if got == nil {
+		t.Fatal("fallback should pick breaker (earliest) account")
+	}
+	if got.UID != "brk" {
+		t.Fatalf("fallback should pick earliest expiry brk (5m < soft 10m), got %+v", got)
+	}
+}
+
+func TestFallbackNilWhenAllDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("want nil when all disabled, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3 三因子加权选取
+// ---------------------------------------------------------------------------
+
+// idleWeightOf 曝露 weightOf 的单因子拆解不便，改用完整权重断言（包内私有 helper）。
+func (p *Pool) entryWeight(uid string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byUID[uid]
+	var maxCredits int64
+	for _, x := range p.byUID {
+		if x.credits > maxCredits {
+			maxCredits = x.credits
+		}
+	}
+	return p.weightOf(e, maxCredits, time.Now())
+}
+
+func TestWeightHighCreditsDominates(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "hi"})
+	p.Add(&auth.Auth{UID: "lo"})
+	p.SetCredits("hi", 1000)
+	p.SetCredits("lo", 10)
+	wHi, wLo := p.entryWeight("hi"), p.entryWeight("lo")
+	if wHi <= wLo {
+		t.Errorf("high credits should weigh more: hi=%v lo=%v", wHi, wLo)
+	}
+}
+
+func TestWeightIdleCompensation(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "used"})
+	p.Add(&auth.Auth{UID: "idle"})
+	p.SetCredits("used", 100)
+	p.SetCredits("idle", 100)
+	// used 1 小时前被选中过、idle 从未使用 → idle 权重更高（闲置补偿）。
+	p.mu.Lock()
+	p.byUID["used"].lastUsed = time.Now().Add(-1 * time.Hour)
+	p.mu.Unlock()
+	wUsed, wIdle := p.entryWeight("used"), p.entryWeight("idle")
+	if wIdle <= wUsed {
+		t.Errorf("idle should weigh more: used=%v idle=%v", wUsed, wIdle)
+	}
+}
+
+func TestWeightLowSuccessRateDowngrades(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "good"})
+	p.Add(&auth.Auth{UID: "bad"})
+	p.SetCredits("good", 100)
+	p.SetCredits("bad", 100)
+	p.NoteSuccess("good")
+	p.NoteError("bad")
+	p.NoteError("bad")
+	wGood, wBad := p.entryWeight("good"), p.entryWeight("bad")
+	if wBad >= wGood {
+		t.Errorf("low success rate should weigh less: good=%v bad=%v", wGood, wBad)
+	}
+}
+
+func TestWeightAllZeroCreditsStillWeighted(t *testing.T) {
+	// credits 全 0：权重完全由 idle+successRate 决定，不退化均匀随机（仍可选出更高分者）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "idle"})
+	p.Add(&auth.Auth{UID: "bursty"})
+	// idle 从未使用、bursty 半分钟前刚用过 → idle 权重更高。
+	p.mu.Lock()
+	p.byUID["bursty"].lastUsed = time.Now().Add(-30 * time.Second)
+	p.mu.Unlock()
+	wIdle, wBursty := p.entryWeight("idle"), p.entryWeight("bursty")
+	if wIdle <= wBursty {
+		t.Errorf("idle should outweigh recently-used when credits all zero: idle=%v bursty=%v", wIdle, wBursty)
+	}
+}
+
+func TestWeightTopFiveSelectionChanges(t *testing.T) {
+	withNoPickGap(t)
+	// credits 相差不大时，闲置补偿可让"低分但久置"的账号权重反超"高分但刚用"的账号，
+	// 即使 credits 排序里 b 在前（Top5 内权重排序可与 credits 排序不同）。
+	p := New("")
+	for _, u := range []string{"a", "b"} {
+		p.Add(&auth.Auth{UID: u})
+	}
+	p.SetCredits("a", 90) // a credits 略低，但久置
+	p.SetCredits("b", 100)
+	p.mu.Lock()
+	p.byUID["b"].lastUsed = time.Now()
+	p.byUID["a"].lastUsed = time.Now().Add(-48 * time.Hour)
+	p.mu.Unlock()
+	if wA, wB := p.entryWeight("a"), p.entryWeight("b"); wA <= wB {
+		t.Errorf("idle a should outweigh busy higher-credit b: a=%v b=%v", wA, wB)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T4 在途租约（单账号并发上限）
+// ---------------------------------------------------------------------------
+
+func TestAcquireReleaseLifecycle(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+	if !p.Acquire("u1") {
+		t.Fatal("first acquire should succeed")
+	}
+	if !p.Acquire("u1") {
+		t.Fatal("second acquire should succeed")
+	}
+	if p.Acquire("u1") {
+		t.Fatal("third acquire should fail (limit 2)")
+	}
+	p.Release("u1")
+	if !p.Acquire("u1") {
+		t.Fatal("acquire after release should succeed")
+	}
+}
+
+func TestAcquireUnlimited(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// max=0 不限：连续 acquire 永不拒绝。
+	for i := 0; i < 100; i++ {
+		if !p.Acquire("u1") {
+			t.Fatalf("unlimited acquire %d failed", i)
+		}
+	}
+}
+
+func TestAcquireUnknownUID(t *testing.T) {
+	p := New("")
+	if p.Acquire("nope") {
+		t.Fatal("acquire unknown uid should fail")
+	}
+	p.Release("nope") // 不 panic
+}
+
+func TestPickSkipsInFlightFull(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "full"})
+	p.Add(&auth.Auth{UID: "free"})
+	p.SetCredits("full", 1000)
+	p.SetCredits("free", 1)
+	p.SetMaxInFlight(1)
+	// full 占满唯一名额 → Pick 应跳过它，选 free（即使 credits 更低）。
+	p.Acquire("full")
+	got := p.Pick()
+	if got == nil || got.UID != "free" {
+		t.Fatalf("pick should skip in-flight-full account, got %+v", got)
+	}
+	p.Release("full")
+	// 释放后可重新被选中（确定性随机源 r=0 → 选 credits 最高的 full）。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	if got := p.Pick(); got == nil || got.UID != "full" {
+		t.Fatalf("after release full should be pickable, got %+v", got)
+	}
+	p.Release("full")
+}
+
+func TestInFlightCountNotExceedLimit(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+
+	// 并发 50 次 acquire：CAS 保证任一时刻在途数不超上限；每次成功后立即 release。
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if p.Acquire("u1") {
+				// 峰值检查：acquire 成功后立即读计数，应 ≤ 2。
+				p.mu.RLock()
+				if n := p.byUID["u1"].inFlight.Load(); n > 2 {
+					t.Errorf("in-flight exceeded limit: %d", n)
+				}
+				p.mu.RUnlock()
+				p.Release("u1")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 全部释放后计数必须为 0。
+	p.mu.RLock()
+	n := p.byUID["u1"].inFlight.Load()
+	p.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("in-flight should be 0 after all releases, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6 向后兼容 + 运行态 Status 扩展
+// ---------------------------------------------------------------------------
+
+func TestLoadLegacyStateFile(t *testing.T) {
+	// 旧 state.json 只含 credits/until/disabled 等老字段，缺熔断/在途/成功率新字段。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	legacy := `{"accounts":{"legacy":{"credits":123,"until":"2027-01-01T04:00:00+08:00","cool_kind":1,"reason":"余额不足"}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "legacy"})
+	st, ok := p.Status("legacy")
+	if !ok {
+		t.Fatal("legacy account should load")
+	}
+	if st.Credits != 123 || !st.Cooling || st.Reason != "余额不足" {
+		t.Errorf("legacy state misloaded: %+v", st)
+	}
+	// 运行态新字段默认零值。
+	if st.InFlight != 0 || st.BreakerFails != 0 || !st.BreakerUntil.IsZero() {
+		t.Errorf("runtime fields should be zero for legacy load: %+v", st)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7 D5: Redis 状态快照镜像 + 择新恢复
+// ---------------------------------------------------------------------------
+
+// memStore 内存假 Store：记录 SaveState（模拟 Redis 快照）并可按需返回 LoadState。
+type memStore struct {
+	mu       sync.Mutex
+	saved    []byte
+	loadData []byte
+	loadOK   bool
+}
+
+func (m *memStore) SaveState(data []byte) {
+	m.mu.Lock()
+	m.saved = append([]byte(nil), data...)
+	m.mu.Unlock()
+}
+func (m *memStore) LoadState() ([]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loadOK {
+		return nil, false
+	}
+	return append([]byte(nil), m.loadData...), true
+}
+
+func TestSaveMirrorsSnapshot(t *testing.T) {
+	// Flush 落盘时同步 fire-and-forget SaveState（带 saved_at）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	ms := &memStore{}
+	p.SetStore(ms)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	ms.mu.Lock()
+	raw := string(ms.saved)
+	ms.mu.Unlock()
+	if !strings.Contains(raw, `"saved_at"`) {
+		t.Fatalf("snapshot should carry saved_at: %s", raw)
+	}
+	if !strings.Contains(raw, `"credits":42`) {
+		t.Fatalf("snapshot should carry account state: %s", raw)
+	}
+}
+
+func TestRestoreUsesRedisWhenNewer(t *testing.T) {
+	// Redis 快照比本地 state.json 新 → 采用 Redis。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	// 本地较旧
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 把本地 mtime 设到过去
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 999 {
+		t.Fatalf("should restore from Redis snapshot: %+v ok=%v", st, ok)
+	}
+}
+
+func TestRestoreUsesLocalWhenNewer(t *testing.T) {
+	// 本地 state.json 比 Redis 快照新 → 本地优先。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":77}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now().Add(-time.Hour)}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 77 {
+		t.Fatalf("should keep local (newer): %+v ok=%v", st, ok)
+	}
+}
+
+func TestRestoreNoRedisUsesLocal(t *testing.T) {
+	// 无 Redis 快照 → 本地优先。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":55}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: false}
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 55 {
+		t.Fatalf("no redis → use local: %+v ok=%v", st, ok)
+	}
+}
+
+func TestStatusExposesRuntimeFields(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+	p.Acquire("u1") // in_flight=1
+	st, _ := p.Status("u1")
+	if st.InFlight != 1 {
+		t.Errorf("in_flight=%d want 1", st.InFlight)
+	}
+	p.SetBreaker(2, time.Hour, 2*time.Hour)
+	p.NoteError("u1") // breaker_fails=1
+	st, _ = p.Status("u1")
+	if st.BreakerFails != 1 {
+		t.Errorf("breaker_fails=%d want 1", st.BreakerFails)
+	}
+	p.Release("u1")
 }

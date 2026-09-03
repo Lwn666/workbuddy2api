@@ -33,6 +33,7 @@ jobs:
 
       - name: Sync upstream
         id: sync
+        shell: bash -e -o pipefail {0}
         run: |
           sh scripts/sync-wb2-fork.sh --ci 2>&1 | tee /tmp/sync.log
           if grep -q 'SYNC_NO_CHANGE=1' /tmp/sync.log; then

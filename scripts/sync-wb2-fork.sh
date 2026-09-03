@@ -37,6 +37,12 @@ RESTORE="
 .github/
 Dockerfile
 README.md
+.dockerignore
+.gitignore
+credit.sh
+login.sh
+signin.sh
+docker-compose.yml
 internal/server/web/
 internal/server/web_extra.go
 internal/server/local_api.go

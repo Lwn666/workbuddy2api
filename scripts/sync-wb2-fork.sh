@@ -99,11 +99,12 @@ check_sym internal/upstream/client.go "func \(c \*Client\) UserResource"
 check_sym internal/scheduler/scheduler.go "func \(s \*Scheduler\) RunCheckinNow"
 check_sym cmd/server/config.go "AuthDir"
 echo "--- 核对补丁变量作用域 ---"
-grep -qE "^\tp := pool.New\(" cmd/server/main.go || err "main.go 缺 p"
-grep -qE "^\tup := upstream.New\(\)" cmd/server/main.go || err "main.go 缺 up"
-grep -qE "^\tsch := scheduler.New\(" cmd/server/main.go || err "main.go 缺 sch"
-grep -qE "^\th := server.NewHandler\(" cmd/server/main.go || err "main.go 缺 h"
-grep -qE "NewLocalAPI" cmd/server/main.go || err "main.go 缺 NewLocalAPI 补丁"
+TAB=$(printf '\t')
+grep -qE "^${TAB}p := pool.New\(" cmd/server/main.go || err "main.go 缺 p"
+grep -qE "^${TAB}up := upstream.New\(\)" cmd/server/main.go || err "main.go 缺 up"
+grep -qE "^${TAB}sch := scheduler.New\(" cmd/server/main.go || err "main.go 缺 sch"
+grep -qE "^${TAB}h := server.NewHandler\(" cmd/server/main.go || err "main.go 缺 h"
+grep -q "NewLocalAPI" cmd/server/main.go || err "main.go 缺 NewLocalAPI 补丁"
 
 # 7. CI 输出
 if [ "$CI" = "1" ]; then

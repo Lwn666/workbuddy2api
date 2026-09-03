@@ -106,6 +106,9 @@ grep -qE "^${TAB}sch := scheduler.New\(" cmd/server/main.go || err "main.go 缺 
 grep -qE "^${TAB}h := server.NewHandler\(" cmd/server/main.go || err "main.go 缺 h"
 grep -q "NewLocalAPI" cmd/server/main.go || err "main.go 缺 NewLocalAPI 补丁"
 
+# 同步 index 与 worktree（避免 git checkout 污染 staging 区）
+git add -A
+
 # 7. CI 输出
 if [ "$CI" = "1" ]; then
   if git diff --quiet HEAD; then

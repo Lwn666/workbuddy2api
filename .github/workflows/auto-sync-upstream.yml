@@ -1,0 +1,81 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    # 每 6 小时检查一次上游更新
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (sync only, no push)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Sync upstream
+        id: sync
+        run: |
+          sh scripts/sync-wb2-fork.sh --ci 2>&1 | tee /tmp/sync.log
+          if grep -q 'SYNC_NO_CHANGE=1' /tmp/sync.log; then
+            echo "has_change=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_change=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No upstream changes
+        if: steps.sync.outputs.has_change == 'false'
+        run: echo "已是最新，无需同步。"
+
+      - name: Verify compilation
+        if: steps.sync.outputs.has_change == 'true'
+        run: |
+          CGO_ENABLED=0 go vet ./cmd/server
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/server
+          echo "✓ 编译通过"
+
+      - name: Bump fpk version and commit
+        if: steps.sync.outputs.has_change == 'true'
+        id: version
+        run: |
+          # 读当前版本，递增 patch
+          CUR=$(grep '^version=' wb2api-fpk/manifest | cut -d= -f2)
+          NEW=$(echo "$CUR" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')
+          echo "version=$CUR -> $NEW"
+          for f in wb2api-fpk/manifest wb2api-fpk-arm/manifest; do
+            sed -i "s/^version=.*/version=$NEW/" "$f"
+          done
+          echo "new_version=$NEW" >> "$GITHUB_OUTPUT"
+
+          # 配置提交身份
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "auto sync upstream: $(date -u +%Y%m%d) -> v$NEW"
+
+      - name: Push master & tag
+        if: steps.sync.outputs.has_change == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin master
+          git tag "v${{ steps.version.outputs.new_version }}"
+          git push origin "v${{ steps.version.outputs.new_version }}"
+          echo "✓ 已推送 master 和 tag v${{ steps.version.outputs.new_version }}"

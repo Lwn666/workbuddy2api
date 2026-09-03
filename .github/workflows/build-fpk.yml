@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: ["master"]
+    tags: ["v*"]
     paths:
       - "cmd/**"
       - "internal/**"
@@ -44,7 +45,12 @@ jobs:
       - name: Build fpk packages
         id: build
         run: |
-          sh scripts/build-fpk.sh "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"
+            sh scripts/build-fpk.sh "$VER"
+          else
+            sh scripts/build-fpk.sh
+          fi
           echo "VERSION=$(grep '^version=' wb2api-fpk/manifest | cut -d= -f2)" >> "$GITHUB_OUTPUT"
           ls -la dist/
 

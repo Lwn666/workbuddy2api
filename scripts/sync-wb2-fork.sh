@@ -53,7 +53,15 @@ wb2api-fpk-arm/
 workbuddy2api-*.fpk
 "
 for p in $RESTORE; do
-  git checkout HEAD -- "$p" 2>/dev/null || true
+  case "$p" in
+    scripts/)
+      # 只恢复上游也有的 scripts 文件，避免覆盖正在运行的自身
+      for sf in sync-upstream.sh sync-auths.sh; do
+        git checkout HEAD -- "scripts/$sf" 2>/dev/null || true
+      done
+      ;;
+    *) git checkout HEAD -- "$p" 2>/dev/null || true ;;
+  esac
 done
 # 恢复后确保关键文件存在
 [ -f internal/server/web_extra.go ] || err "web_extra.go 恢复失败"
